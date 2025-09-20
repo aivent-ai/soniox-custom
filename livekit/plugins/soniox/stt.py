@@ -175,6 +175,7 @@ class SpeechStream(stt.SpeechStream):
         self._utterance_count = 0
         self._should_reconnect_after_utterance = self._stt._params.enable_dual_stream
         self._endpoint_detected = False
+        self._session_id = 0  # Add session ID to make each connection unique
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp ClientSession for WebSocket connections."""
@@ -190,6 +191,22 @@ class SpeechStream(stt.SpeechStream):
         # With dual-stream mode, we always want endpoint detection for reconnect triggers
         enable_endpoint_detection = not self._stt._vad_stream or self._should_reconnect_after_utterance
 
+        # Increment session ID for each new connection
+        if self._should_reconnect_after_utterance:
+            self._session_id += 1
+            
+        # For dual-stream mode: after first utterance, don't send context to prevent caching
+        context_to_use = self._stt._params.context
+        if self._should_reconnect_after_utterance and self._utterance_count > 0:
+            # Clear context after first utterance to prevent word caching
+            context_to_use = ""  # Empty string instead of None
+            logger.info(f"Session {self._session_id}: Using empty context to prevent caching")
+        
+        # Create unique client reference ID for each session
+        client_ref = self._stt._params.client_reference_id
+        if self._should_reconnect_after_utterance:
+            client_ref = f"{client_ref or 'session'}_{self._session_id}_{self._utterance_count}"
+        
         # Create initial config object.
         config = {
             "api_key": self._stt._api_key,
@@ -199,11 +216,11 @@ class SpeechStream(stt.SpeechStream):
             "enable_endpoint_detection": enable_endpoint_detection,
             "sample_rate": self._stt._params.sample_rate,
             "language_hints": self._stt._params.language_hints,
-            "context": self._stt._params.context,
+            "context": context_to_use,
             "enable_non_final_tokens": self._stt._params.enable_non_final_tokens,
             "max_non_final_tokens_duration_ms": self._stt._params.max_non_final_tokens_duration_ms,
             "enable_language_identification": self._stt._params.enable_language_identification,
-            "client_reference_id": self._stt._params.client_reference_id,
+            "client_reference_id": client_ref,
         }
         # Connect to the Soniox Speech-to-Text API.
         ws = await asyncio.wait_for(
@@ -212,7 +229,12 @@ class SpeechStream(stt.SpeechStream):
         )
         # Set initial configuration message.
         await ws.send_str(json.dumps(config))
-        logger.debug("Soniox Speech-to-Text API connection established!")
+        
+        if self._should_reconnect_after_utterance:
+            logger.info(f"Soniox connection established (session={self._session_id}, utterance={self._utterance_count}, context_cleared={self._utterance_count > 0})")
+        else:
+            logger.debug("Soniox Speech-to-Text API connection established!")
+        
         return ws
 
     async def _run(self) -> None:
@@ -392,7 +414,7 @@ class SpeechStream(stt.SpeechStream):
                                         # Trigger reconnect for dual-stream mode after endpoint
                                         if self._should_reconnect_after_utterance:
                                             self._utterance_count += 1
-                                            logger.info(f"Endpoint detected (utterance #{self._utterance_count}), triggering reconnect for fresh context")
+                                            logger.info(f"Endpoint detected (utterance #{self._utterance_count}), triggering reconnect with cleared context")
                                             # Set the reconnect event to trigger reconnect in main loop
                                             self._reconnect_event.set()
                                     else:
