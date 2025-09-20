@@ -208,9 +208,14 @@ class SpeechStream(stt.SpeechStream):
                 # Initialize primary and secondary WebSocket connections
                 ws = await self._connect_ws()
                 self._ws = ws
+                logger.info("Primary WebSocket connection established")
+                
                 ws_secondary = await self._connect_ws(is_reconnect=True)
                 self._ws_secondary = ws_secondary
+                logger.info("Secondary WebSocket connection established")
+                
                 self._current_ws_is_primary = True
+                logger.info("Initial state: using primary stream")
 
                 # Create task for audio processing, voice turn detection and message handling.
                 tasks = [
@@ -434,6 +439,8 @@ class SpeechStream(stt.SpeechStream):
 
         async def process_message(msg, is_from_primary):
             """Process a message if it's from the current active stream."""
+            nonlocal final_transcript_buffer, final_transcript_language
+            
             # Only process messages from the currently active stream
             if is_from_primary != self._current_ws_is_primary:
                 return
@@ -442,8 +449,15 @@ class SpeechStream(stt.SpeechStream):
                 try:
                     content = json.loads(msg.data)
                     tokens = content["tokens"]
+                    
+                    # Debug logging for received message
+                    logger.debug(f"Received message from {'primary' if is_from_primary else 'secondary'} stream, current active: {'primary' if self._current_ws_is_primary else 'secondary'}, tokens count: {len(tokens) if tokens else 0}")
 
                     if tokens:
+                        # Log token details
+                        for t in tokens:
+                            logger.debug(f"Token: text='{t.get('text')}', is_final={t.get('is_final')}")
+                        
                         if len(tokens) == 1 and tokens[0]["text"] == FINALIZED_TOKEN:
                             # Ignore finalized token, prevent auto finalize cycle.
                             pass
