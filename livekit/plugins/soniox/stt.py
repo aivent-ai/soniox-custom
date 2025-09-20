@@ -473,6 +473,11 @@ class SpeechStream(stt.SpeechStream):
                                 # Current heuristic is to take the first language we see.
                                 if token.get("language") and not final_transcript_language:
                                     final_transcript_language = token.get("language")
+                                
+                                # Trigger stream switch on any final token (not just endpoints)
+                                if not self._switching:
+                                    logger.info(f"FINAL TOKEN DETECTED: '{token.get('text')}' - Triggering stream switch (current: {'primary' if self._current_ws_is_primary else 'secondary'})")
+                                    asyncio.create_task(self._switch_streams())
                         else:
                             non_final_transcription += token["text"]
                             if token.get("language") and not non_final_transcription_language:
