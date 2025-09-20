@@ -159,8 +159,6 @@ class SpeechStream(stt.SpeechStream):
 
         self.audio_queue = asyncio.Queue()
         self._switch_buffer = []
-        self._max_switch_buffer_size = 100  # Maximum number of audio frames to buffer during switch
-        self._reconnect_tasks = set()  # Track reconnection tasks
 
         self._last_tokens_received: float | None = None
 
@@ -271,10 +269,6 @@ class SpeechStream(stt.SpeechStream):
                     f"An unexpected error occurred: {e}") from e
             # Close the WebSocket connection on finish.
             finally:
-                # Cancel any pending reconnection tasks
-                for task in self._reconnect_tasks:
-                    task.cancel()
-                
                 if self._ws is not None:
                     await self._ws.close()
                     self._ws = None
@@ -317,12 +311,9 @@ class SpeechStream(stt.SpeechStream):
                 # Get the raw bytes from the audio frame.
                 pcm_data = data.data.tobytes()
 
-                # Buffer audio during switch with overflow protection
+                # Buffer audio during switch
                 if self._switching:
-                    if len(self._switch_buffer) < self._max_switch_buffer_size:
-                        self._switch_buffer.append(pcm_data)
-                    else:
-                        logger.warning("Switch buffer overflow, dropping audio frame")
+                    self._switch_buffer.append(pcm_data)
                 else:
                     self.audio_queue.put_nowait(pcm_data)
 
@@ -383,10 +374,8 @@ class SpeechStream(stt.SpeechStream):
                 self._switch_buffer.clear()
 
                 # Reconnect the old stream with fresh context in background
-                task = asyncio.create_task(self._reconnect_stream(old_ws,
-                                                                  not self._current_ws_is_primary))
-                self._reconnect_tasks.add(task)
-                task.add_done_callback(self._handle_task_exception)
+                asyncio.create_task(self._reconnect_stream(old_ws,
+                                                           not self._current_ws_is_primary))
 
                 switch_time = (time.time() - start_time) * 1000
                 logger.debug(f"Stream switch completed in {switch_time:.1f}ms")
@@ -394,34 +383,15 @@ class SpeechStream(stt.SpeechStream):
             finally:
                 self._switching = False
 
-    def _handle_task_exception(self, task: asyncio.Task):
-        """Handle exceptions from background tasks."""
-        self._reconnect_tasks.discard(task)
-        try:
-            task.result()
-        except Exception as e:
-            logger.error(f"Background task failed: {e}")
-
-    async def _reconnect_stream(self, old_ws, is_primary, retry_count=0):
-        """Reconnect a stream with fresh context with retry logic."""
-        max_retries = 3
-        
-        if retry_count >= max_retries:
-            logger.error(f"Failed to reconnect stream after {max_retries} attempts")
-            # Set the stream to None to indicate failure
-            if is_primary:
-                self._ws = None
-            else:
-                self._ws_secondary = None
-            return
-        
+    async def _reconnect_stream(self, old_ws, is_primary):
+        """Reconnect a stream with fresh context."""
         try:
             # Close old connection
             if old_ws and not old_ws.closed:
                 await old_ws.close()
 
-            # Brief delay before reconnecting with exponential backoff
-            await asyncio.sleep(0.1 * (2 ** retry_count))
+            # Brief delay before reconnecting
+            await asyncio.sleep(0.1)
 
             # Reconnect with fresh context
             new_ws = await self._connect_ws(is_reconnect=True)
@@ -430,13 +400,9 @@ class SpeechStream(stt.SpeechStream):
                 self._ws = new_ws
             else:
                 self._ws_secondary = new_ws
-                
-            logger.debug(f"Successfully reconnected {'primary' if is_primary else 'secondary'} stream")
 
         except Exception as e:
-            logger.error(f"Error reconnecting stream (attempt {retry_count + 1}/{max_retries}): {e}")
-            # Retry with exponential backoff
-            await self._reconnect_stream(old_ws, is_primary, retry_count + 1)
+            logger.error(f"Error reconnecting stream: {e}")
 
     async def _recv_messages_task(self):
         """Receive transcription messages from both streams but only process from current."""
@@ -465,109 +431,99 @@ class SpeechStream(stt.SpeechStream):
         # Method handles receiving messages from the Soniox Speech-to-Text API.
         while self._ws and self._ws_secondary:
             try:
-                # Get current active WebSocket - check on each iteration to detect switches
+                # Get current active WebSocket
                 current_ws = self._ws if self._current_ws_is_primary else self._ws_secondary
-                
-                if not current_ws or current_ws.closed:
-                    await asyncio.sleep(0.1)
-                    continue
-                    
-                # Use timeout to periodically check if stream has switched
-                try:
-                    msg = await asyncio.wait_for(current_ws.receive(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    continue  # Re-check which stream is active
-                
-                # Process the message
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        content = json.loads(msg.data)
-                        tokens = content["tokens"]
 
-                        if tokens:
-                            if len(tokens) == 1 and tokens[0][
-                                "text"] == FINALIZED_TOKEN:
-                                # Ignore finalized token, prevent auto finalize cycle.
-                                pass
-                            else:
-                                # Got at least one token, reset the auto finalize delay.
-                                self._last_tokens_received = time.time()
+                async for msg in current_ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            content = json.loads(msg.data)
+                            tokens = content["tokens"]
 
-                        # We will only send the final tokens after we get the "endpoint" event.
-                        non_final_transcription = ""
-                        non_final_transcription_language: str = ""
-
-                        for token in tokens:
-                            if token["is_final"]:
-                                if is_end_token(token):
-                                    # Found an endpoint, tokens until here will be sent as
-                                    # transcript, the rest will be sent as interim tokens
-                                    # (even final tokens).
-                                    send_endpoint_transcript()
-                                    # Trigger stream switch after endpoint
-                                    asyncio.create_task(
-                                        self._switch_streams())
+                            if tokens:
+                                if len(tokens) == 1 and tokens[0][
+                                    "text"] == FINALIZED_TOKEN:
+                                    # Ignore finalized token, prevent auto finalize cycle.
+                                    pass
                                 else:
-                                    final_transcript_buffer += token["text"]
+                                    # Got at least one token, reset the auto finalize delay.
+                                    self._last_tokens_received = time.time()
 
-                                    # Soniox provides language for each token,
-                                    # LiveKit requires only a single language for the entire transcription chunk.
-                                    # Current heuristic is to take the first language we see.
-                                    if token.get(
-                                            "language") and not final_transcript_language:
-                                        final_transcript_language = token.get(
+                            # We will only send the final tokens after we get the "endpoint" event.
+                            non_final_transcription = ""
+                            non_final_transcription_language: str = ""
+
+                            for token in tokens:
+                                if token["is_final"]:
+                                    if is_end_token(token):
+                                        # Found an endpoint, tokens until here will be sent as
+                                        # transcript, the rest will be sent as interim tokens
+                                        # (even final tokens).
+                                        send_endpoint_transcript()
+                                        # Trigger stream switch after endpoint
+                                        asyncio.create_task(
+                                            self._switch_streams())
+                                    else:
+                                        final_transcript_buffer += token["text"]
+
+                                        # Soniox provides language for each token,
+                                        # LiveKit requires only a single language for the entire transcription chunk.
+                                        # Current heuristic is to take the first language we see.
+                                        if token.get(
+                                                "language") and not final_transcript_language:
+                                            final_transcript_language = token.get(
+                                                "language")
+                                else:
+                                    non_final_transcription += token["text"]
+                                    if (
+                                            token.get("language")
+                                            and not non_final_transcription_language
+                                    ):
+                                        non_final_transcription_language = token.get(
                                             "language")
-                            else:
-                                non_final_transcription += token["text"]
-                                if (
-                                        token.get("language")
-                                        and not non_final_transcription_language
-                                ):
-                                    non_final_transcription_language = token.get(
-                                        "language")
 
-                        if final_transcript_buffer or non_final_transcription:
-                            event = stt.SpeechEvent(
-                                type=SpeechEventType.INTERIM_TRANSCRIPT,
-                                alternatives=[
-                                    stt.SpeechData(
-                                        text=final_transcript_buffer + non_final_transcription,
-                                        language=final_transcript_language
-                                        if final_transcript_language
-                                        else non_final_transcription_language,
-                                    )
-                                ],
-                            )
-                            self._event_ch.send_nowait(event)
+                            if final_transcript_buffer or non_final_transcription:
+                                event = stt.SpeechEvent(
+                                    type=SpeechEventType.INTERIM_TRANSCRIPT,
+                                    alternatives=[
+                                        stt.SpeechData(
+                                            text=final_transcript_buffer + non_final_transcription,
+                                            language=final_transcript_language
+                                            if final_transcript_language
+                                            else non_final_transcription_language,
+                                        )
+                                    ],
+                                )
+                                self._event_ch.send_nowait(event)
 
-                        error_code = content.get("error_code")
-                        error_message = content.get("error_message")
+                            error_code = content.get("error_code")
+                            error_message = content.get("error_message")
 
-                        if error_code or error_message:
-                            # In case of error, still send the final transcript.
-                            send_endpoint_transcript()
-                            logger.error(
-                                f"WebSocket error: {error_code} - {error_message}")
+                            if error_code or error_message:
+                                # In case of error, still send the final transcript.
+                                send_endpoint_transcript()
+                                logger.error(
+                                    f"WebSocket error: {error_code} - {error_message}")
 
-                        finished = content.get("finished")
+                            finished = content.get("finished")
 
-                        if finished:
-                            # When finished, still send the final transcript.
-                            send_endpoint_transcript()
-                            logger.debug("Transcription finished")
+                            if finished:
+                                # When finished, still send the final transcript.
+                                send_endpoint_transcript()
+                                logger.debug("Transcription finished")
 
-                    except Exception as e:
-                        logger.exception(f"Error processing message: {e}")
-                elif msg.type in (
-                        aiohttp.WSMsgType.CLOSED,
-                        aiohttp.WSMsgType.CLOSE,
-                        aiohttp.WSMsgType.CLOSING,
-                ):
-                    break
-                else:
-                    logger.warning(
-                        f"Unexpected message type from Soniox Speech-to-Text API: {msg.type}"
-                    )
+                        except Exception as e:
+                            logger.exception(f"Error processing message: {e}")
+                    elif msg.type in (
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                    ):
+                        break
+                    else:
+                        logger.warning(
+                            f"Unexpected message type from Soniox Speech-to-Text API: {msg.type}"
+                        )
             except aiohttp.ClientError as e:
                 logger.error(f"WebSocket error while receiving: {e}")
             except Exception as e:
