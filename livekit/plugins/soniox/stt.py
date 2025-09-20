@@ -171,9 +171,10 @@ class SpeechStream(stt.SpeechStream):
 
         self._last_tokens_received: float | None = None
         
-        # Dual-stream support
+        # Dual-stream support to prevent context caching
         self._utterance_count = 0
         self._should_reconnect_after_utterance = self._stt._params.enable_dual_stream
+        self._endpoint_detected = False
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp ClientSession for WebSocket connections."""
@@ -186,7 +187,8 @@ class SpeechStream(stt.SpeechStream):
         """Open a WebSocket connection to the Soniox Speech-to-Text API and send the
         initial configuration."""
         # If VAD was passed, disable endpoint detection, otherwise enable it.
-        enable_endpoint_detection = not self._stt._vad_stream
+        # With dual-stream mode, we always want endpoint detection for reconnect triggers
+        enable_endpoint_detection = not self._stt._vad_stream or self._should_reconnect_after_utterance
 
         # Create initial config object.
         config = {
@@ -242,6 +244,7 @@ class SpeechStream(stt.SpeechStream):
                         break
 
                     self._reconnect_event.clear()
+                    self._endpoint_detected = False  # Reset for next utterance
                 finally:
                     await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
             # Handle errors.
@@ -385,6 +388,13 @@ class SpeechStream(stt.SpeechStream):
                                         # transcript, the rest will be sent as interim tokens
                                         # (even final tokens).
                                         send_endpoint_transcript()
+                                        
+                                        # Trigger reconnect for dual-stream mode after endpoint
+                                        if self._should_reconnect_after_utterance and not self._endpoint_detected:
+                                            self._utterance_count += 1
+                                            self._endpoint_detected = True
+                                            logger.info(f"Endpoint detected (utterance #{self._utterance_count}), triggering reconnect for fresh context")
+                                            self._reconnect_event.set()
                                     else:
                                         final_transcript_buffer += token["text"]
 
@@ -429,12 +439,6 @@ class SpeechStream(stt.SpeechStream):
                                 # When finished, still send the final transcript.
                                 send_endpoint_transcript()
                                 logger.debug("Transcription finished")
-                                
-                                # Trigger reconnect for dual-stream mode
-                                if self._should_reconnect_after_utterance:
-                                    self._utterance_count += 1
-                                    logger.info(f"Utterance #{self._utterance_count} completed, triggering reconnect for fresh context")
-                                    self._reconnect_event.set()
 
                         except Exception as e:
                             logger.exception(f"Error processing message: {e}")
