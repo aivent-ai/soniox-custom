@@ -15,12 +15,10 @@
 from __future__ import annotations
 
 import asyncio
-import enum
 import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import aiohttp
 
@@ -53,14 +51,6 @@ END_TOKEN = "<end>"
 FINALIZED_TOKEN = "<fin>"
 
 
-class StreamState(enum.Enum):
-    """State of an individual stream in the dual-stream system."""
-    IDLE = "idle"  # Stream ist bereit, Audio zu empfangen
-    ACTIVE = "active"  # Stream verarbeitet aktiv Audio
-    RECONNECTING = "reconnecting"  # Stream wird neu verbunden
-    CLOSED = "closed"  # Stream ist geschlossen
-
-
 def is_end_token(token: dict) -> bool:
     """Return True if the given token marks an end or finalized event."""
     return token.get("text") in (END_TOKEN, FINALIZED_TOKEN)
@@ -83,11 +73,6 @@ class STTOptions:
     max_non_final_tokens_duration_ms: int | None = None
 
     client_reference_id: str | None = None
-    
-    # Dual-stream configuration
-    enable_dual_stream: bool = True  # Enable dual-stream mode to prevent context caching
-    stream_switch_delay_ms: int = 100  # Delay when switching streams
-    max_reconnect_attempts: int = 3  # Max reconnect attempts per stream
 
 
 class STT(stt.STT):
@@ -101,13 +86,13 @@ class STT(stt.STT):
     """
 
     def __init__(
-        self,
-        *,
-        api_key: str | None = None,
-        base_url: str = BASE_URL,
-        http_session: aiohttp.ClientSession | None = None,
-        vad: vad.VAD | None = None,
-        params: STTOptions | None = None,
+            self,
+            *,
+            api_key: str | None = None,
+            base_url: str = BASE_URL,
+            http_session: aiohttp.ClientSession | None = None,
+            vad: vad.VAD | None = None,
+            params: STTOptions | None = None,
     ):
         """Initialize instance of Soniox Speech-to-Text API service.
 
@@ -120,7 +105,8 @@ class STT(stt.STT):
             params: Additional configuration parameters, such as model, language hints, context and
                 speaker diarization.
         """
-        super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=True))
+        super().__init__(capabilities=stt.STTCapabilities(streaming=True,
+                                                          interim_results=True))
 
         self._api_key = api_key or os.getenv("SONIOX_API_KEY")
         self._base_url = base_url
@@ -129,11 +115,11 @@ class STT(stt.STT):
         self._params = params or STTOptions()
 
     async def _recognize_impl(
-        self,
-        buffer: utils.AudioBuffer,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions,
+            self,
+            buffer: utils.AudioBuffer,
+            *,
+            language: NotGivenOr[str] = NOT_GIVEN,
+            conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
         """Raise error since single-frame recognition is not supported
         by Soniox Speech-to-Text API."""
@@ -142,13 +128,12 @@ class STT(stt.STT):
         )
 
     def stream(
-        self,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+            self,
+            *,
+            language: NotGivenOr[str] = NOT_GIVEN,
+            conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SpeechStream:
         """Return a new LiveKit streaming speech-to-text session."""
-        # Always use regular SpeechStream with reconnect support
         return SpeechStream(
             stt=self,
             conn_options=conn_options,
@@ -157,25 +142,25 @@ class STT(stt.STT):
 
 class SpeechStream(stt.SpeechStream):
     def __init__(
-        self,
-        stt: STT,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+            self,
+            stt: STT,
+            conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> None:
         """Set up state and queues for a WebSocket-based transcription stream."""
-        super().__init__(stt=stt, conn_options=conn_options, sample_rate=stt._params.sample_rate)
+        super().__init__(stt=stt, conn_options=conn_options,
+                         sample_rate=stt._params.sample_rate)
         self._stt = stt
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._ws_secondary: aiohttp.ClientWebSocketResponse | None = None
+        self._current_ws_is_primary = True
+        self._switching = False
+        self._switch_lock = asyncio.Lock()
         self._reconnect_event = asyncio.Event()
 
         self.audio_queue = asyncio.Queue()
+        self._switch_buffer = []
 
         self._last_tokens_received: float | None = None
-        
-        # Dual-stream support to prevent context caching
-        self._utterance_count = 0
-        self._should_reconnect_after_utterance = self._stt._params.enable_dual_stream
-        self._endpoint_detected = False
-        self._session_id = 0  # Add session ID to make each connection unique
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp ClientSession for WebSocket connections."""
@@ -184,29 +169,12 @@ class SpeechStream(stt.SpeechStream):
 
         return self._stt._http_session
 
-    async def _connect_ws(self):
+    async def _connect_ws(self, is_reconnect=False):
         """Open a WebSocket connection to the Soniox Speech-to-Text API and send the
         initial configuration."""
         # If VAD was passed, disable endpoint detection, otherwise enable it.
-        # With dual-stream mode, we always want endpoint detection for reconnect triggers
-        enable_endpoint_detection = not self._stt._vad_stream or self._should_reconnect_after_utterance
+        enable_endpoint_detection = not self._stt._vad_stream
 
-        # Increment session ID for each new connection
-        if self._should_reconnect_after_utterance:
-            self._session_id += 1
-            
-        # For dual-stream mode: after first utterance, don't send context to prevent caching
-        context_to_use = self._stt._params.context
-        if self._should_reconnect_after_utterance and self._utterance_count > 0:
-            # Clear context after first utterance to prevent word caching
-            context_to_use = ""  # Empty string instead of None
-            logger.info(f"Session {self._session_id}: Using empty context to prevent caching")
-        
-        # Create unique client reference ID for each session
-        client_ref = self._stt._params.client_reference_id
-        if self._should_reconnect_after_utterance:
-            client_ref = f"{client_ref or 'session'}_{self._session_id}_{self._utterance_count}"
-        
         # Create initial config object.
         config = {
             "api_key": self._stt._api_key,
@@ -216,11 +184,11 @@ class SpeechStream(stt.SpeechStream):
             "enable_endpoint_detection": enable_endpoint_detection,
             "sample_rate": self._stt._params.sample_rate,
             "language_hints": self._stt._params.language_hints,
-            "context": context_to_use,
+            "context": self._stt._params.context,
             "enable_non_final_tokens": self._stt._params.enable_non_final_tokens,
             "max_non_final_tokens_duration_ms": self._stt._params.max_non_final_tokens_duration_ms,
             "enable_language_identification": self._stt._params.enable_language_identification,
-            "client_reference_id": client_ref,
+            "client_reference_id": self._stt._params.client_reference_id,
         }
         # Connect to the Soniox Speech-to-Text API.
         ws = await asyncio.wait_for(
@@ -229,20 +197,21 @@ class SpeechStream(stt.SpeechStream):
         )
         # Set initial configuration message.
         await ws.send_str(json.dumps(config))
-        
-        if self._should_reconnect_after_utterance:
-            logger.info(f"Soniox connection established (session={self._session_id}, utterance={self._utterance_count}, context_cleared={self._utterance_count > 0})")
-        else:
+        if not is_reconnect:
             logger.debug("Soniox Speech-to-Text API connection established!")
-        
         return ws
 
     async def _run(self) -> None:
-        """Manage connection lifecycle, spawning tasks and handling reconnection."""
+        """Manage dual-stream connection lifecycle, spawning tasks and handling reconnection."""
         while True:
             try:
+                # Initialize primary and secondary WebSocket connections
                 ws = await self._connect_ws()
                 self._ws = ws
+                ws_secondary = await self._connect_ws(is_reconnect=True)
+                self._ws_secondary = ws_secondary
+                self._current_ws_is_primary = True
+
                 # Create task for audio processing, voice turn detection and message handling.
                 tasks = [
                     asyncio.create_task(self._prepare_audio_task()),
@@ -251,7 +220,8 @@ class SpeechStream(stt.SpeechStream):
                     asyncio.create_task(self._recv_messages_task()),
                     asyncio.create_task(self._keepalive_task()),
                 ]
-                wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
+                wait_reconnect_task = asyncio.create_task(
+                    self._reconnect_event.wait())
                 try:
                     done, _ = await asyncio.wait(
                         [asyncio.gather(*tasks), wait_reconnect_task],
@@ -266,9 +236,9 @@ class SpeechStream(stt.SpeechStream):
                         break
 
                     self._reconnect_event.clear()
-                    self._endpoint_detected = False  # Reset for next utterance
                 finally:
-                    await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
+                    await utils.aio.gracefully_cancel(*tasks,
+                                                      wait_reconnect_task)
             # Handle errors.
             except asyncio.TimeoutError as e:
                 logger.error(
@@ -284,28 +254,40 @@ class SpeechStream(stt.SpeechStream):
                     + f"{e.status} {e.message}"
                 )
                 raise APIStatusError(
-                    message=e.message, status_code=e.status, request_id=None, body=None
+                    message=e.message, status_code=e.status, request_id=None,
+                    body=None
                 ) from e
 
             except aiohttp.ClientError as e:
                 logger.error(f"Soniox Speech-to-Text API connection error: {e}")
-                raise APIConnectionError(f"Soniox Speech-to-Text API connection error: {e}") from e
+                raise APIConnectionError(
+                    f"Soniox Speech-to-Text API connection error: {e}") from e
 
             except Exception as e:
                 logger.exception(f"Unexpected error occurred: {e}")
-                raise APIConnectionError(f"An unexpected error occurred: {e}") from e
+                raise APIConnectionError(
+                    f"An unexpected error occurred: {e}") from e
             # Close the WebSocket connection on finish.
             finally:
                 if self._ws is not None:
                     await self._ws.close()
                     self._ws = None
+                if self._ws_secondary is not None:
+                    await self._ws_secondary.close()
+                    self._ws_secondary = None
 
     async def _keepalive_task(self):
-        """Periodically send keepalive messages (while no audio is being sent)
-        to maintain the WebSocket connection."""
+        """Periodically send keepalive messages to both WebSocket connections."""
         try:
-            while self._ws:
-                await self._ws.send_str(KEEPALIVE_MESSAGE)
+            while self._ws and self._ws_secondary:
+                current_ws = self._ws if self._current_ws_is_primary else self._ws_secondary
+                secondary_ws = self._ws_secondary if self._current_ws_is_primary else self._ws
+
+                if current_ws and not current_ws.closed:
+                    await current_ws.send_str(KEEPALIVE_MESSAGE)
+                if secondary_ws and not secondary_ws.closed:
+                    await secondary_ws.send_str(KEEPALIVE_MESSAGE)
+
                 await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Error while sending keep alive message: {e}")
@@ -313,7 +295,8 @@ class SpeechStream(stt.SpeechStream):
     async def _prepare_audio_task(self):
         """Read audio frames, process VAD, and enqueue PCM data for sending."""
         if not self._ws:
-            logger.error("WebSocket connection to Soniox Speech-to-Text API is not established")
+            logger.error(
+                "WebSocket connection to Soniox Speech-to-Text API is not established")
             return
 
         async for data in self._input_ch:
@@ -327,22 +310,31 @@ class SpeechStream(stt.SpeechStream):
             if isinstance(data, rtc.AudioFrame):
                 # Get the raw bytes from the audio frame.
                 pcm_data = data.data.tobytes()
-                self.audio_queue.put_nowait(pcm_data)
+
+                # Buffer audio during switch
+                if self._switching:
+                    self._switch_buffer.append(pcm_data)
+                else:
+                    self.audio_queue.put_nowait(pcm_data)
 
     async def _send_audio_task(self):
-        """Take queued audio data and transmit it over the WebSocket."""
+        """Take queued audio data and transmit it over the current WebSocket."""
         if not self._ws:
-            logger.error("WebSocket connection to Soniox Speech-to-Text API is not established")
+            logger.error(
+                "WebSocket connection to Soniox Speech-to-Text API is not established")
             return
 
-        while self._ws:
+        while self._ws and self._ws_secondary:
             try:
                 data = await self.audio_queue.get()
 
+                # Send to current active WebSocket
+                current_ws = self._ws if self._current_ws_is_primary else self._ws_secondary
+
                 if isinstance(data, bytes):
-                    await self._ws.send_bytes(data)
+                    await current_ws.send_bytes(data)
                 else:
-                    await self._ws.send_str(data)
+                    await current_ws.send_str(data)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -359,8 +351,61 @@ class SpeechStream(stt.SpeechStream):
             if event.type == vad.VADEventType.END_OF_SPEECH:
                 self.audio_queue.put_nowait(FINALIZE_MESSAGE)
 
+    async def _switch_streams(self):
+        """Switch to the secondary stream and reconnect the old one with fresh context."""
+        async with self._switch_lock:
+            if self._switching:
+                return
+            self._switching = True
+
+            try:
+                start_time = time.time()
+
+                # Determine old and new streams
+                old_ws = self._ws if self._current_ws_is_primary else self._ws_secondary
+
+                # Switch current stream
+                self._current_ws_is_primary = not self._current_ws_is_primary
+
+                # Send buffered audio to new current stream
+                current_ws = self._ws if self._current_ws_is_primary else self._ws_secondary
+                for audio_data in self._switch_buffer:
+                    await current_ws.send_bytes(audio_data)
+                self._switch_buffer.clear()
+
+                # Reconnect the old stream with fresh context in background
+                asyncio.create_task(self._reconnect_stream(old_ws,
+                                                           not self._current_ws_is_primary))
+
+                switch_time = (time.time() - start_time) * 1000
+                logger.debug(f"Stream switch completed in {switch_time:.1f}ms")
+
+            finally:
+                self._switching = False
+
+    async def _reconnect_stream(self, old_ws, is_primary):
+        """Reconnect a stream with fresh context."""
+        try:
+            # Close old connection
+            if old_ws and not old_ws.closed:
+                await old_ws.close()
+
+            # Brief delay before reconnecting
+            await asyncio.sleep(0.1)
+
+            # Reconnect with fresh context
+            new_ws = await self._connect_ws(is_reconnect=True)
+
+            if is_primary:
+                self._ws = new_ws
+            else:
+                self._ws_secondary = new_ws
+
+        except Exception as e:
+            logger.error(f"Error reconnecting stream: {e}")
+
     async def _recv_messages_task(self):
-        """Receive transcription messages, handle tokens, errors, and dispatch events."""
+        """Receive transcription messages from both streams but only process from current."""
 
         # Transcription frame will be only sent after we get the "endpoint" event.
         final_transcript_buffer = ""
@@ -374,7 +419,8 @@ class SpeechStream(stt.SpeechStream):
                     type=SpeechEventType.FINAL_TRANSCRIPT,
                     alternatives=[
                         stt.SpeechData(
-                            text=final_transcript_buffer, language=final_transcript_language
+                            text=final_transcript_buffer,
+                            language=final_transcript_language
                         )
                     ],
                 )
@@ -383,16 +429,20 @@ class SpeechStream(stt.SpeechStream):
                 final_transcript_language = ""
 
         # Method handles receiving messages from the Soniox Speech-to-Text API.
-        while self._ws:
+        while self._ws and self._ws_secondary:
             try:
-                async for msg in self._ws:
+                # Get current active WebSocket
+                current_ws = self._ws if self._current_ws_is_primary else self._ws_secondary
+
+                async for msg in current_ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             content = json.loads(msg.data)
                             tokens = content["tokens"]
 
                             if tokens:
-                                if len(tokens) == 1 and tokens[0]["text"] == FINALIZED_TOKEN:
+                                if len(tokens) == 1 and tokens[0][
+                                    "text"] == FINALIZED_TOKEN:
                                     # Ignore finalized token, prevent auto finalize cycle.
                                     pass
                                 else:
@@ -410,28 +460,27 @@ class SpeechStream(stt.SpeechStream):
                                         # transcript, the rest will be sent as interim tokens
                                         # (even final tokens).
                                         send_endpoint_transcript()
-                                        
-                                        # Trigger reconnect for dual-stream mode after endpoint
-                                        if self._should_reconnect_after_utterance:
-                                            self._utterance_count += 1
-                                            logger.info(f"Endpoint detected (utterance #{self._utterance_count}), triggering reconnect with cleared context")
-                                            # Set the reconnect event to trigger reconnect in main loop
-                                            self._reconnect_event.set()
+                                        # Trigger stream switch after endpoint
+                                        asyncio.create_task(
+                                            self._switch_streams())
                                     else:
                                         final_transcript_buffer += token["text"]
 
                                         # Soniox provides language for each token,
                                         # LiveKit requires only a single language for the entire transcription chunk.
                                         # Current heuristic is to take the first language we see.
-                                        if token.get("language") and not final_transcript_language:
-                                            final_transcript_language = token.get("language")
+                                        if token.get(
+                                                "language") and not final_transcript_language:
+                                            final_transcript_language = token.get(
+                                                "language")
                                 else:
                                     non_final_transcription += token["text"]
                                     if (
-                                        token.get("language")
-                                        and not non_final_transcription_language
+                                            token.get("language")
+                                            and not non_final_transcription_language
                                     ):
-                                        non_final_transcription_language = token.get("language")
+                                        non_final_transcription_language = token.get(
+                                            "language")
 
                             if final_transcript_buffer or non_final_transcription:
                                 event = stt.SpeechEvent(
@@ -453,7 +502,8 @@ class SpeechStream(stt.SpeechStream):
                             if error_code or error_message:
                                 # In case of error, still send the final transcript.
                                 send_endpoint_transcript()
-                                logger.error(f"WebSocket error: {error_code} - {error_message}")
+                                logger.error(
+                                    f"WebSocket error: {error_code} - {error_message}")
 
                             finished = content.get("finished")
 
@@ -465,9 +515,9 @@ class SpeechStream(stt.SpeechStream):
                         except Exception as e:
                             logger.exception(f"Error processing message: {e}")
                     elif msg.type in (
-                        aiohttp.WSMsgType.CLOSED,
-                        aiohttp.WSMsgType.CLOSE,
-                        aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
                     ):
                         break
                     else:
@@ -478,317 +528,3 @@ class SpeechStream(stt.SpeechStream):
                 logger.error(f"WebSocket error while receiving: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error while receiving messages: {e}")
-
-
-class DualSpeechStream_DEPRECATED(stt.SpeechStream):
-    """Dual-stream implementation to prevent Soniox context caching.
-    
-    Uses two parallel WebSocket connections and switches between them after
-    each utterance to ensure fresh context for each transcription.
-    """
-    
-    def __init__(
-        self,
-        stt: STT,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> None:
-        """Initialize dual-stream manager."""
-        super().__init__(stt=stt, conn_options=conn_options)
-        self._stt = stt
-        
-        # Two parallel streams
-        self._stream_a: Optional[SpeechStream] = None
-        self._stream_b: Optional[SpeechStream] = None
-        
-        # Stream states
-        self._stream_a_state = StreamState.IDLE
-        self._stream_b_state = StreamState.IDLE
-        
-        # Currently active stream
-        self._active_stream: Optional[SpeechStream] = None
-        self._inactive_stream: Optional[SpeechStream] = None
-        
-        # Locks for thread safety
-        self._switch_lock = asyncio.Lock()
-        
-        # Statistics
-        self._switch_count = 0
-        self._last_switch_time: Optional[float] = None
-        
-        # Control flags
-        self._running = False
-        self._switching = False
-
-    async def _run(self) -> None:
-        """Main run loop for dual-stream manager."""
-        self._running = True
-        
-        try:
-            # Initialize both streams
-            logger.info("Initializing dual-stream mode...")
-            
-            # Create first stream
-            self._stream_a = SpeechStream(self._stt, self._conn_options)
-            self._stream_a_state = StreamState.IDLE
-            
-            # Create second stream  
-            self._stream_b = SpeechStream(self._stt, self._conn_options)
-            self._stream_b_state = StreamState.IDLE
-            
-            # Set stream A as initial active stream
-            self._active_stream = self._stream_a
-            self._inactive_stream = self._stream_b
-            self._stream_a_state = StreamState.ACTIVE
-            
-            logger.info("Dual-stream mode initialized successfully")
-            
-            # Start tasks
-            tasks = [
-                asyncio.create_task(self._handle_audio_task()),
-                asyncio.create_task(self._handle_vad_task()),
-                asyncio.create_task(self._merge_events_task()),
-                asyncio.create_task(self._monitor_streams_task()),
-            ]
-            
-            # Start both stream's run loops
-            stream_a_task = asyncio.create_task(self._stream_a._run())
-            stream_b_task = asyncio.create_task(self._stream_b._run())
-            
-            tasks.extend([stream_a_task, stream_b_task])
-            
-            # Wait for all tasks
-            done, pending = await asyncio.wait(
-                tasks, 
-                return_when=asyncio.FIRST_EXCEPTION
-            )
-            
-            for task in done:
-                if task.exception():
-                    raise task.exception()
-            
-        except Exception as e:
-            logger.error(f"Error in dual-stream manager: {e}")
-            raise
-        finally:
-            self._running = False
-            await self._cleanup_streams()
-
-    async def _handle_endpoint_detection(self) -> None:
-        """Handle endpoint detection for stream switching.
-        
-        Since we're not using VAD, we need to detect when Soniox sends
-        an endpoint token to trigger stream switch.
-        """
-        while self._running:
-            if self._active_stream:
-                try:
-                    # Monitor the active stream's event channel for END tokens
-                    event = await asyncio.wait_for(
-                        self._active_stream._event_ch.recv(),
-                        timeout=0.5
-                    )
-                    
-                    # Check if this is a final transcript (endpoint detected)
-                    if event.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        logger.debug("Endpoint detected, switching streams...")
-                        await self._switch_streams("endpoint_detection")
-                    
-                    # Forward the event to output
-                    self._event_ch.send_nowait(event)
-                    
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error in endpoint detection: {e}")
-            else:
-                await asyncio.sleep(0.1)
-
-    async def _handle_audio_task(self) -> None:
-        """Forward audio frames to the active stream."""
-        async for data in self._input_ch:
-            if not self._active_stream:
-                continue
-                
-            # During switch, buffer audio briefly
-            if self._switching:
-                await asyncio.sleep(0.01)
-                
-            # Forward to active stream
-            if self._active_stream:
-                self._active_stream._input_ch.send_nowait(data)
-
-    async def _handle_vad_task(self) -> None:
-        """Handle VAD events and trigger stream switches."""
-        # If VAD is disabled, use endpoint detection instead
-        if not self._stt._vad_stream:
-            await self._handle_endpoint_detection()
-            return
-            
-        # VAD-based switching
-        async for event in self._stt._vad_stream:
-            if event.type == vad.VADEventType.END_OF_SPEECH:
-                logger.debug("VAD detected end of speech, switching streams...")
-                await self._switch_streams("vad_end_of_speech")
-
-    async def _switch_streams(self, reason: str) -> None:
-        """Switch between streams A and B.
-        
-        Args:
-            reason: Reason for the switch (for logging)
-        """
-        async with self._switch_lock:
-            if not self._active_stream or not self._inactive_stream:
-                logger.error("Cannot switch: streams not properly initialized")
-                return
-                
-            self._switching = True
-            
-            try:
-                logger.debug(f"Switching streams (reason: {reason})")
-                
-                # Finalize current stream
-                if self._active_stream._ws:
-                    await self._active_stream._ws.send_str(FINALIZE_MESSAGE)
-                
-                # Wait briefly for smooth transition
-                await asyncio.sleep(self._stt._params.stream_switch_delay_ms / 1000.0)
-                
-                # Swap active and inactive streams
-                old_active = self._active_stream
-                self._active_stream = self._inactive_stream
-                self._inactive_stream = old_active
-                
-                # Update states
-                if old_active == self._stream_a:
-                    self._stream_a_state = StreamState.RECONNECTING
-                    self._stream_b_state = StreamState.ACTIVE
-                else:
-                    self._stream_b_state = StreamState.RECONNECTING
-                    self._stream_a_state = StreamState.ACTIVE
-                
-                # Reconnect the old active stream in background
-                asyncio.create_task(self._reconnect_stream(
-                    old_active,
-                    "A" if old_active == self._stream_a else "B"
-                ))
-                
-                # Update statistics
-                self._switch_count += 1
-                self._last_switch_time = time.time()
-                
-                logger.info(f"Stream switch #{self._switch_count} completed")
-                
-            finally:
-                self._switching = False
-
-    async def _reconnect_stream(self, stream: SpeechStream, name: str) -> None:
-        """Reconnect a stream with fresh context.
-        
-        Args:
-            stream: Stream to reconnect
-            name: Stream name for logging
-        """
-        logger.debug(f"Reconnecting stream {name}...")
-        
-        for attempt in range(self._stt._params.max_reconnect_attempts):
-            try:
-                # Close existing connection
-                if stream._ws:
-                    await stream._ws.close()
-                    stream._ws = None
-                
-                # Brief pause before reconnect
-                await asyncio.sleep(0.2)
-                
-                # Create a new fresh stream instance
-                new_stream = SpeechStream(self._stt, self._conn_options)
-                
-                # Replace the old stream
-                if name == "A":
-                    self._stream_a = new_stream
-                    self._inactive_stream = new_stream
-                    self._stream_a_state = StreamState.IDLE
-                    # Start the new stream's run loop
-                    asyncio.create_task(new_stream._run())
-                else:
-                    self._stream_b = new_stream
-                    self._inactive_stream = new_stream
-                    self._stream_b_state = StreamState.IDLE
-                    # Start the new stream's run loop
-                    asyncio.create_task(new_stream._run())
-                
-                logger.debug(f"Stream {name} reconnected successfully")
-                return
-                
-            except Exception as e:
-                logger.error(f"Failed to reconnect stream {name} "
-                           f"(attempt {attempt + 1}/{self._stt._params.max_reconnect_attempts}): {e}")
-                
-                if attempt == self._stt._params.max_reconnect_attempts - 1:
-                    # Mark as closed after final attempt
-                    if name == "A":
-                        self._stream_a_state = StreamState.CLOSED
-                    else:
-                        self._stream_b_state = StreamState.CLOSED
-
-    async def _merge_events_task(self) -> None:
-        """Merge events from both streams into single output channel."""
-        # This task is handled by _handle_endpoint_detection when VAD is disabled
-        # or by forwarding events directly when VAD is enabled
-        if self._stt._vad_stream:
-            # With VAD, we need to merge events differently
-            while self._running:
-                if self._active_stream:
-                    try:
-                        # Get event from active stream with timeout
-                        event = await asyncio.wait_for(
-                            self._active_stream._event_ch.recv(),
-                            timeout=0.1
-                        )
-                        # Forward to output channel
-                        self._event_ch.send_nowait(event)
-                    except asyncio.TimeoutError:
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error merging events: {e}")
-                else:
-                    await asyncio.sleep(0.1)
-
-    async def _monitor_streams_task(self) -> None:
-        """Monitor stream health and log statistics."""
-        last_log_time = time.time()
-        
-        while self._running:
-            try:
-                # Check stream health
-                if self._stream_a_state == StreamState.CLOSED and \
-                   self._stream_b_state == StreamState.CLOSED:
-                    logger.error("Both streams closed, stopping...")
-                    break
-                
-                # Log statistics periodically
-                if time.time() - last_log_time > 30:
-                    active_name = "A" if self._active_stream == self._stream_a else "B"
-                    logger.info(
-                        f"Dual-stream stats: switches={self._switch_count}, "
-                        f"active={active_name}, states=[A={self._stream_a_state.value}, "
-                        f"B={self._stream_b_state.value}]"
-                    )
-                    last_log_time = time.time()
-                
-                await asyncio.sleep(1)
-                
-            except Exception as e:
-                logger.error(f"Error in monitor task: {e}")
-
-    async def _cleanup_streams(self) -> None:
-        """Clean up both streams on shutdown."""
-        logger.info("Cleaning up dual-stream connections...")
-        
-        if self._stream_a and self._stream_a._ws:
-            await self._stream_a._ws.close()
-            
-        if self._stream_b and self._stream_b._ws:
-            await self._stream_b._ws.close()
-        
-        logger.info("Dual-stream cleanup completed")
