@@ -390,10 +390,10 @@ class SpeechStream(stt.SpeechStream):
                                         send_endpoint_transcript()
                                         
                                         # Trigger reconnect for dual-stream mode after endpoint
-                                        if self._should_reconnect_after_utterance and not self._endpoint_detected:
+                                        if self._should_reconnect_after_utterance:
                                             self._utterance_count += 1
-                                            self._endpoint_detected = True
                                             logger.info(f"Endpoint detected (utterance #{self._utterance_count}), triggering reconnect for fresh context")
+                                            # Set the reconnect event to trigger reconnect in main loop
                                             self._reconnect_event.set()
                                     else:
                                         final_transcript_buffer += token["text"]
