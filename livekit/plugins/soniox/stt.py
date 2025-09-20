@@ -148,16 +148,11 @@ class STT(stt.STT):
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SpeechStream:
         """Return a new LiveKit streaming speech-to-text session."""
-        if self._params.enable_dual_stream:
-            return DualSpeechStream(
-                stt=self,
-                conn_options=conn_options,
-            )
-        else:
-            return SpeechStream(
-                stt=self,
-                conn_options=conn_options,
-            )
+        # Always use regular SpeechStream with reconnect support
+        return SpeechStream(
+            stt=self,
+            conn_options=conn_options,
+        )
 
 
 class SpeechStream(stt.SpeechStream):
@@ -175,6 +170,10 @@ class SpeechStream(stt.SpeechStream):
         self.audio_queue = asyncio.Queue()
 
         self._last_tokens_received: float | None = None
+        
+        # Dual-stream support
+        self._utterance_count = 0
+        self._should_reconnect_after_utterance = self._stt._params.enable_dual_stream
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp ClientSession for WebSocket connections."""
@@ -430,6 +429,12 @@ class SpeechStream(stt.SpeechStream):
                                 # When finished, still send the final transcript.
                                 send_endpoint_transcript()
                                 logger.debug("Transcription finished")
+                                
+                                # Trigger reconnect for dual-stream mode
+                                if self._should_reconnect_after_utterance:
+                                    self._utterance_count += 1
+                                    logger.info(f"Utterance #{self._utterance_count} completed, triggering reconnect for fresh context")
+                                    self._reconnect_event.set()
 
                         except Exception as e:
                             logger.exception(f"Error processing message: {e}")
@@ -449,7 +454,7 @@ class SpeechStream(stt.SpeechStream):
                 logger.error(f"Unexpected error while receiving messages: {e}")
 
 
-class DualSpeechStream(stt.SpeechStream):
+class DualSpeechStream_DEPRECATED(stt.SpeechStream):
     """Dual-stream implementation to prevent Soniox context caching.
     
     Uses two parallel WebSocket connections and switches between them after
@@ -498,12 +503,10 @@ class DualSpeechStream(stt.SpeechStream):
             
             # Create first stream
             self._stream_a = SpeechStream(self._stt, self._conn_options)
-            await self._stream_a._connect_ws()
             self._stream_a_state = StreamState.IDLE
             
-            # Create second stream
+            # Create second stream  
             self._stream_b = SpeechStream(self._stt, self._conn_options)
-            await self._stream_b._connect_ws()
             self._stream_b_state = StreamState.IDLE
             
             # Set stream A as initial active stream
@@ -521,13 +524,21 @@ class DualSpeechStream(stt.SpeechStream):
                 asyncio.create_task(self._monitor_streams_task()),
             ]
             
-            # Run stream tasks for both streams
-            stream_a_task = asyncio.create_task(self._run_stream(self._stream_a, "A"))
-            stream_b_task = asyncio.create_task(self._run_stream(self._stream_b, "B"))
+            # Start both stream's run loops
+            stream_a_task = asyncio.create_task(self._stream_a._run())
+            stream_b_task = asyncio.create_task(self._stream_b._run())
             
             tasks.extend([stream_a_task, stream_b_task])
             
-            await asyncio.gather(*tasks)
+            # Wait for all tasks
+            done, pending = await asyncio.wait(
+                tasks, 
+                return_when=asyncio.FIRST_EXCEPTION
+            )
+            
+            for task in done:
+                if task.exception():
+                    raise task.exception()
             
         except Exception as e:
             logger.error(f"Error in dual-stream manager: {e}")
@@ -536,23 +547,35 @@ class DualSpeechStream(stt.SpeechStream):
             self._running = False
             await self._cleanup_streams()
 
-    async def _run_stream(self, stream: SpeechStream, name: str) -> None:
-        """Run a single stream's event loop.
+    async def _handle_endpoint_detection(self) -> None:
+        """Handle endpoint detection for stream switching.
         
-        Args:
-            stream: The stream to run
-            name: Stream name for logging ("A" or "B")
+        Since we're not using VAD, we need to detect when Soniox sends
+        an endpoint token to trigger stream switch.
         """
-        try:
-            # Start the stream's internal run loop
-            await stream._run()
-        except Exception as e:
-            logger.error(f"Error in stream {name}: {e}")
-            # Mark stream as closed
-            if name == "A":
-                self._stream_a_state = StreamState.CLOSED
+        while self._running:
+            if self._active_stream:
+                try:
+                    # Monitor the active stream's event channel for END tokens
+                    event = await asyncio.wait_for(
+                        self._active_stream._event_ch.recv(),
+                        timeout=0.5
+                    )
+                    
+                    # Check if this is a final transcript (endpoint detected)
+                    if event.type == SpeechEventType.FINAL_TRANSCRIPT:
+                        logger.debug("Endpoint detected, switching streams...")
+                        await self._switch_streams("endpoint_detection")
+                    
+                    # Forward the event to output
+                    self._event_ch.send_nowait(event)
+                    
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error in endpoint detection: {e}")
             else:
-                self._stream_b_state = StreamState.CLOSED
+                await asyncio.sleep(0.1)
 
     async def _handle_audio_task(self) -> None:
         """Forward audio frames to the active stream."""
@@ -570,9 +593,12 @@ class DualSpeechStream(stt.SpeechStream):
 
     async def _handle_vad_task(self) -> None:
         """Handle VAD events and trigger stream switches."""
+        # If VAD is disabled, use endpoint detection instead
         if not self._stt._vad_stream:
+            await self._handle_endpoint_detection()
             return
             
+        # VAD-based switching
         async for event in self._stt._vad_stream:
             if event.type == vad.VADEventType.END_OF_SPEECH:
                 logger.debug("VAD detected end of speech, switching streams...")
@@ -648,17 +674,22 @@ class DualSpeechStream(stt.SpeechStream):
                 # Brief pause before reconnect
                 await asyncio.sleep(0.2)
                 
-                # Reconnect with fresh context
-                stream._ws = await stream._connect_ws()
+                # Create a new fresh stream instance
+                new_stream = SpeechStream(self._stt, self._conn_options)
                 
-                # Restart stream tasks
-                stream_task = asyncio.create_task(stream._run())
-                
-                # Update state
+                # Replace the old stream
                 if name == "A":
+                    self._stream_a = new_stream
+                    self._inactive_stream = new_stream
                     self._stream_a_state = StreamState.IDLE
+                    # Start the new stream's run loop
+                    asyncio.create_task(new_stream._run())
                 else:
+                    self._stream_b = new_stream
+                    self._inactive_stream = new_stream
                     self._stream_b_state = StreamState.IDLE
+                    # Start the new stream's run loop
+                    asyncio.create_task(new_stream._run())
                 
                 logger.debug(f"Stream {name} reconnected successfully")
                 return
@@ -676,22 +707,26 @@ class DualSpeechStream(stt.SpeechStream):
 
     async def _merge_events_task(self) -> None:
         """Merge events from both streams into single output channel."""
-        while self._running:
-            if self._active_stream:
-                try:
-                    # Get event from active stream with timeout
-                    event = await asyncio.wait_for(
-                        self._active_stream._event_ch.recv(),
-                        timeout=0.1
-                    )
-                    # Forward to output channel
-                    self._event_ch.send_nowait(event)
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error merging events: {e}")
-            else:
-                await asyncio.sleep(0.1)
+        # This task is handled by _handle_endpoint_detection when VAD is disabled
+        # or by forwarding events directly when VAD is enabled
+        if self._stt._vad_stream:
+            # With VAD, we need to merge events differently
+            while self._running:
+                if self._active_stream:
+                    try:
+                        # Get event from active stream with timeout
+                        event = await asyncio.wait_for(
+                            self._active_stream._event_ch.recv(),
+                            timeout=0.1
+                        )
+                        # Forward to output channel
+                        self._event_ch.send_nowait(event)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error merging events: {e}")
+                else:
+                    await asyncio.sleep(0.1)
 
     async def _monitor_streams_task(self) -> None:
         """Monitor stream health and log statistics."""
